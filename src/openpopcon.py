@@ -40,6 +40,7 @@ DEFAULT_SCALINGLAWS = get_POPCON_homedir(['resources','scalinglaws.yml'])
             ('delta', nb.float64),
             ('B0', nb.float64),
             ('Ip', nb.float64),
+            ('Itot', nb.float64),
             ('H', nb.float64),
             ('M_i', nb.float64),
             ('tipeak_over_tepeak', nb.float64),
@@ -97,6 +98,7 @@ DEFAULT_SCALINGLAWS = get_POPCON_homedir(['resources','scalinglaws.yml'])
             ('B0_alpha', nb.float64),
             ('Pheat_alpha', nb.float64),
             ('n20_alpha', nb.float64),
+            ('resistivity_alg', nb.int16),
             ('verbosity', nb.int64),
           ]) # type: ignore
 class POPCON_algorithms:
@@ -158,6 +160,7 @@ class POPCON_algorithms:
         self.delta: float                  # Triangularity
         self.B0: float                     # Magnetic field at axis in Tesla
         self.Ip: float                     # Plasma current in MA
+        self.Itot: float                   # Total current in MA
         self.M_i: float                    # Ion mass in amu
         self.tipeak_over_tepeak: float     # Ti/Te peak ratio
         #*** 1 = D-D, 2 = D-T, 3 = D-He3 ***
@@ -254,6 +257,7 @@ class POPCON_algorithms:
         #---------------------------------------------------------------
         # Etc
         #---------------------------------------------------------------
+        self.resistivity_alg: int = 0                           # Resistivity algorithm. 0 = Jardin, 1 = Paz-Soldan, 2 = local maximum
         self.verbosity: int = 0                                 # Verbosity level. 0 = silent, 1 = normal, 2 = debug, 3 = print all matrices
 
         pass
@@ -409,7 +413,7 @@ class POPCON_algorithms:
         """
         Neoclassical resistivity in Ohm-m.
 
-        Equations 16-17 from [1] Jardin et al. 1993
+        Equations 16-17 from [1] Jardin et al. 1993, or equation 6 from [8] Paz-Soldan et al. 2016
         """
 
         if np.any(rho <= 0):
@@ -443,7 +447,11 @@ class POPCON_algorithms:
             nu_star_e = 1/10.2e16 * self.R * q * n_e_r * np.exp(logLambda) / (f_t_prof * invaspect * (T_e_r*1e3)**2)
             eta_C_eta_NC_ratio = Lambda_E * ( 1 - f_t_prof/( 1 + xi * nu_star_e ) )*( 1 - C_R*f_t_prof/( 1 + xi * nu_star_e ) )
 
+
         eta_NC = eta_C / eta_C_eta_NC_ratio
+
+        if self.resistivity_alg == 0:
+            return eta_NC
 
         f_CL = (1+1.2*Zeffprof + 0.22*Zeffprof**2)/(1+3*Zeffprof + 0.75*Zeffprof**2)
         
@@ -451,12 +459,19 @@ class POPCON_algorithms:
 
         eta_NC_2 = eta_C * f_CL * f_NC
 
-        eta_NC_max = np.empty_like(eta_NC)
+        if self.resistivity_alg == 1:
+            return eta_NC_2
 
-        for i in range(len(eta_NC)):
-            eta_NC_max[i] = max(eta_NC[i], eta_NC_2[i])
+        if self.resistivity_alg == 2:
+            eta_NC_max = np.empty_like(eta_NC)
 
-        return eta_NC_max
+            for i in range(len(eta_NC)):
+                eta_NC_max[i] = max(eta_NC[i], eta_NC_2[i])
+
+            return eta_NC_max
+        
+        else:
+            raise ValueError("Invalid resistivity algorithm. Must be 0, 1, or 2.")
 
     
     def Vloop(self, T_e_keV, n_e_20) -> float:
@@ -681,7 +696,7 @@ class POPCON_algorithms:
         """
 
         eta_NC = self.eta_NC(rho, T_e_keV, n_e_20)
-        J = self.Ip*1e6*self.get_profile(rho, 0)
+        J = self.Itot*1e6*self.get_profile(rho, 0)
         return 1e-6*eta_NC*J**2
 
     def Q_fusion(self, T_i_keV:float, n_e_20:float, Paux:float) -> float:
@@ -692,10 +707,11 @@ class POPCON_algorithms:
         dil = self.plasma_dilution(T_e_keV)
         n_i_20 = n_e_20*dil
         P_fusion = self.volume_integral(self.sqrtpsin, self._P_fusion(self.sqrtpsin, T_i_keV, n_i_20))
+        P_OH = self.volume_integral(self.sqrtpsin, self._P_OH_prof(self.sqrtpsin, T_e_keV, n_e_20))
         if Paux == 0:
             return 9999999.
         else:
-            return P_fusion/(Paux)
+            return P_fusion/(Paux + P_OH)
     
     #-------------------------------------------------------------------
     # Power Balance Relaxation Solvers
@@ -1025,8 +1041,6 @@ class POPCON_settings:
             self.Te_alpha2 = float(safe_get(data,'Te_alpha2',1.5))
             self.Te_offset = float(safe_get(data,'Te_offset',0))
 
-            
-
             #-----------------------------------------------------------
             # Settings
             #-----------------------------------------------------------
@@ -1036,6 +1050,7 @@ class POPCON_settings:
             self.nmin_frac = float(data['nmin_frac'])
             self.Tmax_keV = float(data['Tmax_keV'])
             self.Tmin_keV = float(data['Tmin_keV'])
+            self.resistivity_model = str(safe_get(data,'resistivity_model','jardin')).lower()
             self.maxit = int(data['maxit'])
             self.accel = float(data['accel'])
             self.err = float(data['err'])
@@ -1497,6 +1512,8 @@ betaN = {betaN:.3f}
                     if self.settings.verbosity > 1:
                         print(f"{name} min: {np.min(data)}, max: {np.max(data)}, levels: {opdict['levels']}")
                     levels = np.linspace(1.01*np.min(data),0.99*np.max(data),opdict['levels'])
+                    if levels[-1] < levels[0]:
+                        levels = levels[::-1]
                 elif opdict['scale'] == 'specified':
                     levels = np.linspace(opdict['min'],opdict['max'],opdict['levels'])
                 else:
@@ -1590,17 +1607,21 @@ betaN = {betaN:.3f}
     # File I/O
     #-------------------------------------------------------------------
 
-    def write_output(self, name:str='', archive:bool=True, overwrite:bool=False) -> None:
+    def write_output(self, name:str='', archive:bool=True, overwrite:bool=False, directory:str=None) -> None:
         """
         Saves the output results to a directory. If archive is True,
         archives the directory as a zip file. If overwrite is True,
-        overwrites the directory/zip if it already exists.
+        overwrites the directory/zip if it already exists. The directory
+        parameter allows specifying the storage location.
         """
         if name == '':
             name = self.settings.name + '_' + datetime.datetime.now().strftime(r"%Y-%m-%d_%H:%M:%S")
 
-        outputsdir = pathlib.Path(__file__).resolve().parent.parent.joinpath('outputs')
-        # Check if directory exists
+        if directory is None:
+            outputsdir = pathlib.Path(__file__).resolve().parent.parent.joinpath('outputs')
+        else:
+            outputsdir = pathlib.Path(directory)
+
         direxists = outputsdir.joinpath(name).exists()
         zipexists = outputsdir.joinpath(name + '.zip').exists()
         if not (direxists or zipexists):
@@ -1641,11 +1662,15 @@ betaN = {betaN:.3f}
             shutil.rmtree(savedir)
             shutil.move(name+'.zip', outputsdir.joinpath(name+'.zip'))
 
-    def read_output(self, name: str) -> None:
+    def read_output(self, name: str, directory: str = None) -> None:
         """
         Restores the POPCON object based on the output directory.
         """
-        outputsdir = pathlib.Path(__file__).resolve().parent.parent.joinpath('outputs')
+        if directory is None:
+            outputsdir = pathlib.Path(__file__).resolve().parent.parent.joinpath('outputs')
+        else:
+            outputsdir = pathlib.Path(directory)
+
         if name.endswith('.zip'):
             outputsdir.joinpath(name[:-4]).mkdir()
             shutil.unpack_archive(outputsdir.joinpath(name), outputsdir.joinpath(name[:-4]))
@@ -1685,6 +1710,9 @@ betaN = {betaN:.3f}
         self.scalinglaws = data
 
     def __setup_params(self) -> None:
+
+        res_dict = {"jardin": 0, "paz-soldan": 1, "maximum":2, "max":2}
+
         self.algorithms = POPCON_algorithms()
         self.algorithms.R = self.settings.R
         self.algorithms.a = self.settings.a
@@ -1697,6 +1725,7 @@ betaN = {betaN:.3f}
         self.algorithms.fuel = self.settings.fuel
         self.algorithms.impurityfractions = self.settings.impurityfractions
         self.algorithms.verbosity = self.settings.verbosity
+        self.algorithms.resistivity_alg = res_dict[self.settings.resistivity_model.lower()]
 
     def __get_profiles(self) -> None:
         if self.settings.profsfilename == '':
@@ -1737,37 +1766,30 @@ betaN = {betaN:.3f}
 
     def __get_geometry(self) -> None:
         if self.settings.gfilename == '':
-            rho = np.linspace(0.001,1,self.settings.nr)
+            rho = np.sqrt(np.linspace(0.001,1,self.settings.nr))
             if self.settings.j_offset == 0:
                 self.settings.j_offset = 1e-6
             self.algorithms._addextprof(rho,-2)
             self.algorithms._set_alpha_and_offset(self.settings.j_alpha1, self.settings.j_alpha2, self.settings.j_offset, 0)
+            self.algorithms.Itot = self.settings.Ip
             
         else:
             gfile = read_eqdsk(self.settings.gfilename)
-            psin, volgrid, agrid, fs = get_fluxvolumes(gfile)
-            sqrtpsin = np.linspace(0.001,0.97,self.settings.nr)
+            psin, volgrid, agrid, fs = get_fluxvolumes(gfile, self.settings.nr)
+            sqrtpsin = np.sqrt(np.linspace(0.001,0.98,self.settings.nr))
             volgrid = np.interp(sqrtpsin,np.sqrt(psin),volgrid)
-
-            ffp = np.asarray(gfile['ffprim'])
-            psi = np.linspace(0,1,ffp.shape[0])
-            f2 = np.cumsum(ffp)*np.diff(psi)[0] + gfile['fpol'][0]**2
-            f = np.sqrt(f2)
-            fp = np.gradient(f,psi)
-
-            pp = np.asarray(gfile['pprime'])
+            _, jrms, jtoravg, cross_sec_areas = get_current_density(gfile, self.settings.nr)
             qpsi = np.asarray(gfile['qpsi'])
             psiq = np.linspace(0,1,qpsi.shape[0])
             qr = np.interp(sqrtpsin,np.sqrt(psiq),qpsi)
-            Jpol = fp/(4e-7*np.pi*gfile['raxis'])
-            Jtor = gfile['raxis']*pp + (1/(4e-7*np.pi))*0.5*ffp/gfile['raxis']
 
-            J = np.sqrt(Jpol**2 + Jtor**2)
-            psiJ = np.linspace(0,1,J.shape[0])
-            Jr = np.interp(sqrtpsin,np.sqrt(psiJ),J)
-            Jr = Jr/Jr[0]
-            Ipint = np.trapz(Jr,2*np.pi*(self.algorithms.a*sqrtpsin)**2)
-            Jr = np.abs(Jr/Ipint)
+
+
+            Ipint = np.abs(np.trapz(y=jtoravg, x=cross_sec_areas))
+            Jrmsint = np.abs(np.trapz(y=jrms, x=cross_sec_areas))
+            
+            Jrms_norm = jrms/Jrmsint
+
 
             lcfs = fs[-1]
             geq_a = (np.max(lcfs[:,0])-np.min(lcfs[:,0]))/2
@@ -1787,9 +1809,21 @@ betaN = {betaN:.3f}
                 print(f"Elongation: {geq_kappa}")
                 print(f"Triangularity: {geq_delta}")
                 print(f"z0: {geq_z0}")
+                print("gEQDSK Ip:",Ipint)
 
+
+            
             psin, ftrapped_profile = get_trapped_particle_fraction(gfile)
             ftrapped_profile = np.interp(sqrtpsin,np.sqrt(psin),ftrapped_profile)
+
+            if self.settings.verbosity > 1:
+                print("Len of psin:",len(psin))
+                print("Len of sqrtpsin:",len(sqrtpsin))
+                print("Len of volgrid:",len(volgrid))
+                print("Len of jrms:",len(jrms))
+                print("Len of qr:",len(qr))
+                print("Len of agrid:",len(agrid))
+                print("Len of ftrapped_profile:",len(ftrapped_profile))
 
             print(np.shape(ftrapped_profile))
 
@@ -1809,10 +1843,15 @@ betaN = {betaN:.3f}
                 print(f"Warning: gEQDSK triangularity ({geq_delta}) differs significantly from settings delta ({self.settings.delta}). Defaulting to gEQDSK value.")
                 self.settings.delta
                 self.algorithms.delta = geq_delta
+            if np.abs(Ipint/self.settings.Ip - 1) > 0.1:
+                print(f"Warning: gEQDSK Ip ({Ipint}) differs significantly from settings Ip ({self.settings.Ip}). Defaulting to gEQDSK value.")
+                self.settings.Ip = Ipint
+                self.algorithms.Ip = Ipint
                 
             self.algorithms._addextprof(sqrtpsin,-2)
             self.algorithms._addextprof(volgrid,-1)
-            self.algorithms._addextprof(Jr,0)
+            self.algorithms._addextprof(Jrms_norm,0)
+            self.algorithms.Itot = Ipint
             self.algorithms._addextprof(qr,5)
             self.algorithms._addextprof(agrid,-3)
             self.algorithms._addextprof(ftrapped_profile,6)
